@@ -57,19 +57,6 @@ python main.py
 
 Windows 也可以雙擊 `run.bat`。
 
-## 部署到 Linux VM
-
-```powershell
-# 首次部署（安裝 ffmpeg + 套件 + 建立 systemd service）
-.\deploy_oracle.ps1
-
-# 更新程式碼
-.\update_bot.ps1
-
-# 查看 log
-.\check_log.ps1
-```
-
 ## 專案結構
 
 ```
@@ -78,10 +65,6 @@ music.py             # 音樂播放核心（MusicCog + MusicControls）
 requirements.txt     # Python 依賴
 .env                 # 環境變數（不上傳）
 run.bat              # Windows 本機啟動
-deploy_oracle.ps1    # 部署到 Oracle VM
-bot_setup.sh         # VM 上的安裝腳本
-update_bot.ps1       # 更新 VM 上的程式碼
-check_log.ps1        # 查看 VM 上的 bot log
 ```
 
 ## License
