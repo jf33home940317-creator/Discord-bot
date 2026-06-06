@@ -118,7 +118,7 @@ class MusicControls(discord.ui.View):
                 item.disabled = True
             await interaction.response.edit_message(view=self)
             await interaction.followup.send('⏹️ 已停止播放並離開語音頻道。', ephemeral=True)
-            await vc.disconnect()
+            await self.cog._safe_disconnect(vc)
         else:
             await interaction.response.send_message('❌ Bot 不在語音頻道', ephemeral=True)
 
@@ -344,6 +344,17 @@ class MusicCog(commands.Cog):
             vc.stop()
             await asyncio.sleep(0.3)
 
+    async def _safe_disconnect(self, vc: discord.VoiceClient):
+        """Disconnect without letting a slow/timed-out voice handshake raise.
+
+        On flaky networks the disconnect confirmation can time out; older
+        discord.py versions let that TimeoutError propagate and break the
+        caller. force=True + swallowing the error keeps us robust."""
+        try:
+            await vc.disconnect(force=True)
+        except Exception as e:
+            log.warning('Voice disconnect error (ignored): %s', e)
+
     # ── Gapless prefetch ───────────────────────────────────────────────
 
     def _schedule_prefetch(self, guild_id: int):
@@ -454,7 +465,7 @@ class MusicCog(commands.Cog):
                 self._schedule_prefetch(guild.id)  # warm up the following track
             else:
                 self._cleanup_guild(guild.id)
-                await vc.disconnect()
+                await self._safe_disconnect(vc)
 
         except Exception:
             log.exception('Unhandled error in _play_next_async, guild %s', guild.id)
@@ -638,8 +649,8 @@ class MusicCog(commands.Cog):
         vc = interaction.guild.voice_client
         if vc:
             self._cleanup_guild(interaction.guild_id)
-            await vc.disconnect()
             await interaction.response.send_message('⏹️ 已停止播放並離開語音頻道。')
+            await self._safe_disconnect(vc)
         else:
             await interaction.response.send_message(
                 '❌ Bot 目前不在語音頻道。', ephemeral=True)
@@ -855,7 +866,7 @@ class MusicCog(commands.Cog):
             vc = guild.voice_client
             if vc and len(vc.channel.members) == 1:
                 self._cleanup_guild(guild.id)
-                await vc.disconnect()
+                await self._safe_disconnect(vc)
         except asyncio.CancelledError:
             pass
         finally:
