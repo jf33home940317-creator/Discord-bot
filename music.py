@@ -21,15 +21,16 @@ FFMPEG_EXECUTABLE = os.getenv(
 )
 
 FFMPEG_OPTIONS = {
-    # Robust reconnection for flaky networks + quieter logging.
-    # -reconnect_on_network_error handles the "Input/output error" drops;
-    # -loglevel error hides the noisy "Will reconnect" chatter.
+    # Robust reconnection for flaky networks. -reconnect_on_network_error
+    # recovers from the transient "Input/output error" stream drops.
     'before_options': (
         '-reconnect 1 -reconnect_streamed 1 '
-        '-reconnect_on_network_error 1 -reconnect_delay_max 10 '
-        '-loglevel error'
+        '-reconnect_on_network_error 1 -reconnect_delay_max 10'
     ),
-    'options': '-vn',
+    # discord.py hardcodes "-loglevel warning" right before the output options,
+    # so our -loglevel must live here (after it) to actually win and silence
+    # the noisy "Will reconnect" / TLS pull-error chatter.
+    'options': '-vn -loglevel fatal',
 }
 
 # Shared yt-dlp options. Using the Python API avoids per-call process spawn
