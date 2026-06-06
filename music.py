@@ -1,6 +1,5 @@
 import os
 import asyncio
-import subprocess
 import random
 import logging
 import re
@@ -11,6 +10,7 @@ from discord.ext import commands
 from discord import app_commands
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
+import yt_dlp
 from collections import deque, namedtuple
 
 log = logging.getLogger('music')
@@ -19,17 +19,25 @@ FFMPEG_EXECUTABLE = os.getenv(
     'FFMPEG_PATH',
     r'C:\ffmpeg\bin\ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg',
 )
-YTDLP_EXECUTABLE = os.getenv(
-    'YTDLP_PATH',
-    'yt-dlp' if sys.platform == 'win32' else '/home/ubuntu/miniconda3/bin/yt-dlp',
-)
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn',
 }
 
-TrackInfo = namedtuple('TrackInfo', ['title', 'url', 'duration', 'thumbnail', 'webpage_url'])
+# Shared yt-dlp options. Using the Python API avoids per-call process spawn
+# overhead and all the stdout encoding hacks the subprocess version needed.
+YDL_BASE_OPTS = {
+    'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
+    'quiet': True,
+    'no_warnings': True,
+    'noplaylist': True,
+    'socket_timeout': 30,
+    'extractor_args': {'youtube': {'player_client': ['android_vr']}},
+}
+
+TrackInfo = namedtuple('TrackInfo', ['title', 'url', 'duration', 'thumbnail', 'webpage_url', 'playlist_tag'])
+TrackInfo.__new__.__defaults__ = (None,)  # playlist_tag defaults to None
 
 
 class MusicControls(discord.ui.View):
@@ -98,11 +106,11 @@ class MusicControls(discord.ui.View):
         vc = self.guild.voice_client
         if vc:
             self.cog._cleanup_guild(self.guild.id)
-            await vc.disconnect()
             for item in self.children:
                 item.disabled = True
             await interaction.response.edit_message(view=self)
             await interaction.followup.send('⏹️ 已停止播放並離開語音頻道。', ephemeral=True)
+            await vc.disconnect()
         else:
             await interaction.response.send_message('❌ Bot 不在語音頻道', ephemeral=True)
 
@@ -121,6 +129,11 @@ class MusicCog(commands.Cog):
         self.autoplay: dict[int, bool] = {}
         self._play_history: dict[int, deque[str]] = {}
         self._text_channels: dict[int, discord.abc.Messageable] = {}
+        self._playlist_counter: dict[int, int] = {}
+        # Gapless playback: pre-resolved stream URL for the next queued track
+        self._prefetch: dict[int, tuple[str, str]] = {}      # gid -> (webpage_url, stream_url)
+        self._prefetch_tasks: dict[int, asyncio.Task] = {}
+        self._leave_tasks: dict[int, asyncio.Task] = {}      # empty-channel grace timers
         self.sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
             client_id=os.getenv('SPOTIFY_CLIENT_ID'),
             client_secret=os.getenv('SPOTIFY_CLIENT_SECRET'),
@@ -143,11 +156,21 @@ class MusicCog(commands.Cog):
         self.loop_mode.pop(guild_id, None)
         self._play_history.pop(guild_id, None)
         self._text_channels.pop(guild_id, None)
+        self._playlist_counter.pop(guild_id, None)
+        self._play_locks.pop(guild_id, None)
+        self._prefetch.pop(guild_id, None)
+        task = self._prefetch_tasks.pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    def _next_playlist_tag(self, guild_id: int) -> int:
+        self._playlist_counter[guild_id] = self._playlist_counter.get(guild_id, 0) + 1
+        return self._playlist_counter[guild_id]
 
     def _add_to_history(self, guild_id: int, track: TrackInfo):
         if guild_id not in self._play_history:
             self._play_history[guild_id] = deque(maxlen=50)
-        vid = track.webpage_url.split('v=')[-1].split('&')[0]
+        vid = self._video_id(track.webpage_url)
         if vid not in self._play_history[guild_id]:
             self._play_history[guild_id].append(vid)
 
@@ -167,153 +190,129 @@ class MusicCog(commands.Cog):
                 return None, '❌ 無法從 Spotify 取得歌曲資訊，請稍後再試。'
         return query, None
 
-    # ── yt-dlp helpers ────────────────────────────────────────────────
-
-    def _run_ytdlp(self, args: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
-        env = {**os.environ, 'PYTHONIOENCODING': 'utf-8', 'PYTHONUTF8': '1'}
-        return subprocess.run(
-            [YTDLP_EXECUTABLE] + args,
-            capture_output=True, timeout=timeout, stdin=subprocess.DEVNULL,
-            env=env,
-        )
+    # ── yt-dlp helpers (Python API) ───────────────────────────────────
 
     @staticmethod
-    def _decode(raw: bytes) -> str:
-        return raw.decode('utf-8', errors='replace')
+    def _fmt_duration(seconds) -> str:
+        """Format duration seconds → 'M:SS' or 'H:MM:SS'."""
+        if not seconds:
+            return '?:??'
+        seconds = int(seconds)
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        return f'{h}:{m:02d}:{s:02d}' if h else f'{m}:{s:02d}'
 
-    def fetch_audio(self, query: str) -> TrackInfo:
-        """Fetch metadata + stream URL. Used for the first song (immediate play)."""
-        if not query.startswith('http'):
-            query = f'ytsearch1:{query}'
+    @staticmethod
+    def _video_id(webpage_url: str) -> str:
+        """Extract the YouTube video id from a watch URL."""
+        return webpage_url.split('v=')[-1].split('&')[0]
 
-        result = self._run_ytdlp([
-            '-f', 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
-            '--no-playlist', '--no-warnings',
-            '--extractor-args', 'youtube:player_client=android_vr',
-            '--print', '%(title)s',
-            '--print', '%(id)s',
-            '--print', '%(duration_string)s',
-            '-g', query,
-        ])
-
-        stdout = self._decode(result.stdout)
-        lines = [l for l in stdout.strip().split('\n') if l]
-
-        if len(lines) < 4:
-            stderr = self._decode(result.stderr)
-            if stderr:
-                log.error('yt-dlp stderr:\n%s', stderr[-500:])
-            raise RuntimeError(f'yt-dlp returned {len(lines)} lines, expected >= 4')
-
-        title = lines[0]
-        video_id = lines[1]
-        duration = lines[2]
-        url = lines[3]
-
+    def _info_to_track(self, info: dict) -> TrackInfo:
+        """Build a TrackInfo from a yt-dlp info dict (flat or full)."""
+        vid = info.get('id') or ''
+        title = info.get('title') or f'(影片 {vid})'
         return TrackInfo(
             title=title,
-            url=url,
-            duration=duration,
-            thumbnail=f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg',
-            webpage_url=f'https://www.youtube.com/watch?v={video_id}',
+            url=info.get('url', ''),
+            duration=self._fmt_duration(info.get('duration')),
+            thumbnail=f'https://i.ytimg.com/vi/{vid}/hqdefault.jpg',
+            webpage_url=f'https://www.youtube.com/watch?v={vid}',
         )
+
+    def _extract(self, query: str, *, flat: bool = False,
+                 playlist: bool = False, playlistend: int | None = None) -> dict:
+        """Run a yt-dlp extraction in-process. Caller runs this in an executor."""
+        opts = dict(YDL_BASE_OPTS)
+        if flat:
+            opts['extract_flat'] = True
+        if playlist:
+            opts['noplaylist'] = False
+        if playlistend is not None:
+            opts['playlistend'] = playlistend
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(query, download=False)
+
+    def fetch_audio(self, query: str) -> TrackInfo:
+        """Resolve metadata + stream URL for a single track (immediate play)."""
+        if not query.startswith('http'):
+            query = f'ytsearch1:{query}'
+        info = self._extract(query)
+        if 'entries' in info:
+            entries = [e for e in info['entries'] if e]
+            if not entries:
+                raise RuntimeError('No search results')
+            info = entries[0]
+        track = self._info_to_track(info)
+        if not track.url:
+            raise RuntimeError('No playable stream URL in result')
+        return track
 
     def fetch_stream_url(self, webpage_url: str) -> str:
         """Re-resolve a fresh stream URL right before playback (avoids expiry)."""
-        result = self._run_ytdlp([
-            '-f', 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best',
-            '--no-playlist', '--no-warnings',
-            '--extractor-args', 'youtube:player_client=android_vr',
-            '-g', webpage_url,
-        ])
-
-        stdout = self._decode(result.stdout)
-        lines = [l for l in stdout.strip().split('\n') if l]
-
-        if not lines:
-            stderr = self._decode(result.stderr)
-            if stderr:
-                log.error('yt-dlp re-resolve stderr:\n%s', stderr[-500:])
+        info = self._extract(webpage_url)
+        if 'entries' in info:
+            info = info['entries'][0]
+        url = info.get('url')
+        if not url:
             raise RuntimeError('Failed to re-resolve stream URL')
-
-        return lines[0]
+        return url
 
     def fetch_playlist(self, url: str) -> list[TrackInfo]:
         """Fetch metadata for all tracks in a YouTube playlist (no stream URLs)."""
-        result = self._run_ytdlp([
-            '--flat-playlist', '--yes-playlist', '--no-warnings',
-            '--print', '%(title)s|||%(id)s|||%(duration_string)s',
-            url,
-        ], timeout=120)
-
-        stdout = self._decode(result.stdout)
-        lines = [l for l in stdout.strip().split('\n') if l]
-
-        if not lines:
-            stderr = self._decode(result.stderr)
-            if stderr:
-                log.error('yt-dlp playlist stderr:\n%s', stderr[-500:])
+        info = self._extract(url, flat=True, playlist=True)
+        entries = [e for e in info.get('entries', []) if e and e.get('id')]
+        if not entries:
             raise RuntimeError('無法取得播放清單資訊')
+        return [self._info_to_track(e) for e in entries]
 
-        tracks = []
-        for line in lines:
-            parts = line.split('|||')
-            if len(parts) < 3:
-                continue
-            title, video_id, duration = parts[0], parts[1], parts[2]
-            if not video_id or video_id == 'NA':
-                continue
-            if not duration or duration == 'NA':
-                duration = '?:??'
-            tracks.append(TrackInfo(
-                title=title if title and title != 'NA' else f'(影片 {video_id})',
-                url='',
-                duration=duration,
-                thumbnail=f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg',
-                webpage_url=f'https://www.youtube.com/watch?v={video_id}',
-            ))
-
-        return tracks
-
-    def _fetch_autoplay_track(self, guild_id: int, last_track: TrackInfo) -> TrackInfo | None:
-        """Get one recommended track via YouTube Radio mix (RD{video_id})."""
-        video_id = last_track.webpage_url.split('v=')[-1].split('&')[0]
-        mix_url = f'https://www.youtube.com/watch?v={video_id}&list=RD{video_id}'
-
-        result = self._run_ytdlp([
-            '--flat-playlist', '--yes-playlist', '--no-warnings',
-            '--playlist-start', '2',
-            '--playlist-end', '26',
-            '--print', '%(title)s|||%(id)s|||%(duration_string)s',
-            mix_url,
-        ], timeout=30)
-
-        stdout = self._decode(result.stdout)
-        lines = [l for l in stdout.strip().split('\n') if l]
-        history = set(self._play_history.get(guild_id, []))
-
+    def _pick_track_from_entries(self, entries: list[dict], history: set[str],
+                                 exclude_id: str = '') -> TrackInfo | None:
+        """Pick the first entry not already in history (else a random one)."""
         candidates = []
-        for line in lines:
-            parts = line.split('|||')
-            if len(parts) < 3:
+        for e in entries:
+            if not e:
                 continue
-            title, vid, duration = parts[0], parts[1], parts[2]
-            if not vid or vid == 'NA':
+            vid = e.get('id')
+            if not vid or vid == exclude_id:
                 continue
-            if not duration or duration == 'NA':
-                duration = '?:??'
-            track = TrackInfo(
-                title=title if title and title != 'NA' else f'(影片 {vid})',
-                url='',
-                duration=duration,
-                thumbnail=f'https://i.ytimg.com/vi/{vid}/hqdefault.jpg',
-                webpage_url=f'https://www.youtube.com/watch?v={vid}',
-            )
+            track = self._info_to_track(e)
             if vid not in history:
                 return track
             candidates.append(track)
-
         return random.choice(candidates) if candidates else None
+
+    def _fetch_autoplay_track(self, guild_id: int, last_track: TrackInfo) -> TrackInfo | None:
+        """Get one recommended track. Tries YouTube Radio Mix first, then search."""
+        video_id = self._video_id(last_track.webpage_url)
+        history = set(self._play_history.get(guild_id, []))
+
+        # Strategy 1: YouTube Radio Mix (RD{video_id})
+        mix_url = f'https://www.youtube.com/watch?v={video_id}&list=RD{video_id}'
+        log.info('Autoplay: trying Radio Mix for %s', video_id)
+        try:
+            info = self._extract(mix_url, flat=True, playlist=True, playlistend=25)
+            track = self._pick_track_from_entries(
+                info.get('entries', []), history, exclude_id=video_id)
+            if track:
+                log.info('Autoplay: picked "%s" from Radio Mix', track.title)
+                return track
+        except Exception as e:
+            log.warning('Autoplay: Radio Mix failed: %s', e)
+
+        # Strategy 2: YouTube search fallback
+        log.info('Autoplay: falling back to search "%s"', last_track.title)
+        try:
+            info = self._extract(f'ytsearch5:{last_track.title}', flat=True)
+            track = self._pick_track_from_entries(
+                info.get('entries', []), history, exclude_id=video_id)
+            if track:
+                log.info('Autoplay: picked "%s" from search', track.title)
+                return track
+        except Exception as e:
+            log.warning('Autoplay: search failed: %s', e)
+
+        log.warning('Autoplay: no track found for "%s"', last_track.title)
+        return None
 
     # ── Embed builder ─────────────────────────────────────────────────
 
@@ -329,6 +328,49 @@ class MusicCog(commands.Cog):
         return embed
 
     # ── Playback engine ───────────────────────────────────────────────
+
+    @staticmethod
+    async def _ensure_stopped(vc: discord.VoiceClient):
+        """Stop any lingering playback so vc.play() won't raise ClientException."""
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+            await asyncio.sleep(0.3)
+
+    # ── Gapless prefetch ───────────────────────────────────────────────
+
+    def _schedule_prefetch(self, guild_id: int):
+        """Resolve the next queued track's stream URL in the background so the
+        transition between songs has no audible gap. Safe to call repeatedly."""
+        queue = self.queues.get(guild_id)
+        if not queue:
+            return
+        next_url = queue[0].webpage_url
+        cached = self._prefetch.get(guild_id)
+        if cached and cached[0] == next_url:
+            return  # already prefetched this track
+        old = self._prefetch_tasks.get(guild_id)
+        if old and not old.done():
+            old.cancel()
+        self._prefetch_tasks[guild_id] = self.bot.loop.create_task(
+            self._prefetch_worker(guild_id, next_url))
+
+    async def _prefetch_worker(self, guild_id: int, webpage_url: str):
+        try:
+            loop = asyncio.get_running_loop()
+            url = await loop.run_in_executor(None, self.fetch_stream_url, webpage_url)
+            self._prefetch[guild_id] = (webpage_url, url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.debug('Prefetch failed for %s: %s', webpage_url, e)
+
+    async def _resolve_stream(self, guild_id: int, track: TrackInfo) -> str:
+        """Return a stream URL for track, using the prefetched one if it matches."""
+        cached = self._prefetch.pop(guild_id, None)
+        if cached and cached[0] == track.webpage_url:
+            return cached[1]
+        return await asyncio.get_running_loop().run_in_executor(
+            None, self.fetch_stream_url, track.webpage_url)
 
     def play_next(self, guild: discord.Guild, error=None):
         """Called from ffmpeg's after callback (worker thread). Schedules async work."""
@@ -354,19 +396,18 @@ class MusicCog(commands.Cog):
                     log.exception('Loop re-resolve failed: %s', track.title)
                     # Fall through to try next from queue instead
                 else:
+                    await self._ensure_stopped(vc)
                     source = discord.FFmpegPCMAudio(
                         url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS)
-                    try:
-                        vc.play(source, after=lambda e: self.play_next(guild, e))
-                    except discord.ClientException:
-                        log.warning('Already playing (loop), guild %s', guild.id)
+                    vc.play(source, after=lambda e: self.play_next(guild, e))
                     return
 
             queue = self.get_queue(guild.id)
 
             # Autoplay: inject a recommendation when queue is empty
-            if not queue and self.autoplay.get(guild.id) and self.now_playing.get(guild.id):
+            if not queue and self.autoplay.get(guild.id, True) and self.now_playing.get(guild.id):
                 last = self.now_playing[guild.id]
+                log.info('Autoplay triggered for guild %s, last: %s', guild.id, last.title)
                 try:
                     rec = await loop.run_in_executor(
                         None, self._fetch_autoplay_track, guild.id, last)
@@ -378,10 +419,14 @@ class MusicCog(commands.Cog):
                     channel = self._text_channels.get(guild.id)
                     if channel:
                         try:
-                            await channel.send(
-                                embed=self.make_embed(rec, status='🎶 自動推薦播放'))
+                            view = MusicControls(self, guild)
+                            msg = await channel.send(
+                                embed=self.make_embed(rec), view=view)
+                            view.message = msg
                         except Exception:
                             pass
+                else:
+                    log.warning('Autoplay: no recommendation found, will disconnect')
 
             # Normal: play next from queue
             if queue:
@@ -389,18 +434,16 @@ class MusicCog(commands.Cog):
                 self.now_playing[guild.id] = track
                 self._add_to_history(guild.id, track)
                 try:
-                    url = await loop.run_in_executor(
-                        None, self.fetch_stream_url, track.webpage_url)
+                    url = await self._resolve_stream(guild.id, track)
                 except Exception:
                     log.exception('Resolve failed, skipping: %s', track.title)
                     self.play_next(guild)
                     return
+                await self._ensure_stopped(vc)
                 source = discord.FFmpegPCMAudio(
                     url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS)
-                try:
-                    vc.play(source, after=lambda e: self.play_next(guild, e))
-                except discord.ClientException:
-                    log.warning('Already playing (next), guild %s', guild.id)
+                vc.play(source, after=lambda e: self.play_next(guild, e))
+                self._schedule_prefetch(guild.id)  # warm up the following track
             else:
                 self._cleanup_guild(guild.id)
                 await vc.disconnect()
@@ -408,10 +451,9 @@ class MusicCog(commands.Cog):
         except Exception:
             log.exception('Unhandled error in _play_next_async, guild %s', guild.id)
 
-    # ── /play ─────────────────────────────────────────────────────────
-    @app_commands.command(name='play', description='播放音樂（YouTube / Spotify 網址或歌名）')
-    @app_commands.describe(query='歌名、YouTube 網址或 Spotify 網址')
-    async def play(self, interaction: discord.Interaction, query: str):
+    # ── /play & /playnext shared logic ───────────────────────────────
+    async def _play_impl(self, interaction: discord.Interaction, query: str,
+                         insert_next: bool = False):
         if not interaction.user.voice:
             await interaction.response.send_message('❌ 請先加入語音頻道！', ephemeral=True)
             return
@@ -438,9 +480,6 @@ class MusicCog(commands.Cog):
                 try:
                     tracks = await asyncio.get_running_loop().run_in_executor(
                         None, self.fetch_playlist, query)
-                except subprocess.TimeoutExpired:
-                    await interaction.followup.send('❌ 播放清單載入逾時，請稍後再試。')
-                    return
                 except Exception:
                     log.exception('fetch_playlist failed: %s', query)
                     await interaction.followup.send(
@@ -451,24 +490,40 @@ class MusicCog(commands.Cog):
                     await interaction.followup.send('❌ 播放清單是空的或無法讀取。')
                     return
 
+                tag = self._next_playlist_tag(interaction.guild_id)
+                tracks = [t._replace(playlist_tag=tag) for t in tracks]
+
                 async with self._get_play_lock(interaction.guild_id):
+                    vc = interaction.guild.voice_client
+                    if vc is None or not vc.is_connected():
+                        vc = await interaction.user.voice.channel.connect()
+
                     queue = self.get_queue(interaction.guild_id)
                     if vc.is_playing() or vc.is_paused():
-                        queue.extend(tracks)
+                        if insert_next:
+                            # Insert at front: new_tracks + existing_queue
+                            new_queue = deque(tracks)
+                            new_queue.extend(queue)
+                            self.queues[interaction.guild_id] = new_queue
+                            queue = new_queue
+                            status = '⏭️ 插播播放清單'
+                        else:
+                            queue.extend(tracks)
+                            status = '✅ 已加入播放清單'
                         embed = discord.Embed(
-                            title='✅ 已加入播放清單',
-                            description=f'新增了 **{len(tracks)}** 首歌曲到佇列',
+                            title=status,
+                            description=f'新增了 **{len(tracks)}** 首歌曲（清單 `#{tag}`）',
                             color=discord.Color.green(),
                         )
                         embed.add_field(name='佇列總數',
                                         value=f'{len(queue)} 首', inline=True)
                         await interaction.followup.send(embed=embed)
+                        self._schedule_prefetch(interaction.guild_id)
                     else:
                         first = tracks[0]
                         rest = tracks[1:]
                         try:
-                            url = await asyncio.get_running_loop().run_in_executor(
-                                None, self.fetch_stream_url, first.webpage_url)
+                            url = await self._resolve_stream(interaction.guild_id, first)
                         except Exception:
                             log.exception('Resolve first playlist track failed: %s',
                                           first.title)
@@ -481,26 +536,29 @@ class MusicCog(commands.Cog):
                             url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS)
                         vc.play(source, after=lambda e: self.play_next(
                             interaction.guild, e))
-                        queue.extend(rest)
+                        if insert_next:
+                            new_queue = deque(rest)
+                            new_queue.extend(queue)
+                            self.queues[interaction.guild_id] = new_queue
+                        else:
+                            queue.extend(rest)
                         view = MusicControls(self, interaction.guild)
                         embed = self.make_embed(first)
                         if rest:
                             embed.add_field(
                                 name='📋 播放清單',
-                                value=f'另有 {len(rest)} 首已加入佇列',
+                                value=f'另有 {len(rest)} 首已加入佇列（清單 `#{tag}`）',
                                 inline=True)
                         msg = await interaction.followup.send(
                             embed=embed, view=view)
                         view.message = msg
+                        self._schedule_prefetch(interaction.guild_id)
                 return
 
             # ── Single track ──────────────────────────────────────
             try:
                 track = await asyncio.get_running_loop().run_in_executor(
                     None, self.fetch_audio, query)
-            except subprocess.TimeoutExpired:
-                await interaction.followup.send('❌ 搜尋逾時，請稍後再試。')
-                return
             except Exception:
                 log.exception('fetch_audio failed: %s', query)
                 await interaction.followup.send(
@@ -508,13 +566,23 @@ class MusicCog(commands.Cog):
                 return
 
             async with self._get_play_lock(interaction.guild_id):
+                vc = interaction.guild.voice_client
+                if vc is None or not vc.is_connected():
+                    vc = await interaction.user.voice.channel.connect()
+
                 queue = self.get_queue(interaction.guild_id)
                 if vc.is_playing() or vc.is_paused():
-                    queue.append(track)
-                    embed = self.make_embed(track, status='✅ 已加入佇列',
-                                            color=discord.Color.green())
-                    embed.add_field(name='佇列位置', value=f'#{len(queue)}', inline=True)
+                    if insert_next:
+                        queue.appendleft(track)
+                        embed = self.make_embed(track, status='⏭️ 插播 — 下一首播放',
+                                                color=discord.Color.orange())
+                    else:
+                        queue.append(track)
+                        embed = self.make_embed(track, status='✅ 已加入佇列',
+                                                color=discord.Color.green())
+                        embed.add_field(name='佇列位置', value=f'#{len(queue)}', inline=True)
                     await interaction.followup.send(embed=embed)
+                    self._schedule_prefetch(interaction.guild_id)
                 else:
                     self.now_playing[interaction.guild_id] = track
                     self._add_to_history(interaction.guild_id, track)
@@ -532,6 +600,18 @@ class MusicCog(commands.Cog):
                 await interaction.followup.send(f'❌ 發生錯誤：{e}')
             except Exception:
                 pass
+
+    # ── /play ─────────────────────────────────────────────────────────
+    @app_commands.command(name='play', description='播放音樂（YouTube / Spotify 網址或歌名）')
+    @app_commands.describe(query='歌名、YouTube 網址或 Spotify 網址')
+    async def play(self, interaction: discord.Interaction, query: str):
+        await self._play_impl(interaction, query, insert_next=False)
+
+    # ── /playnext ─────────────────────────────────────────────────────
+    @app_commands.command(name='playnext', description='插播 — 將歌曲插入佇列最前面，下一首播放')
+    @app_commands.describe(query='歌名、YouTube 網址或 Spotify 網址')
+    async def playnext(self, interaction: discord.Interaction, query: str):
+        await self._play_impl(interaction, query, insert_next=True)
 
     # ── /skip ─────────────────────────────────────────────────────────
     @app_commands.command(name='skip', description='跳過目前這首歌')
@@ -617,8 +697,58 @@ class MusicCog(commands.Cog):
         lst = list(queue)
         removed = lst.pop(position - 1)
         self.queues[interaction.guild_id] = deque(lst)
+        if position == 1:
+            self._schedule_prefetch(interaction.guild_id)  # front changed
         await interaction.response.send_message(
             f'🗑️ 已移除第 {position} 首：**{removed.title}**')
+
+    # ── /remove-playlist ─────────────────────────────────────────────
+    @app_commands.command(name='remove-playlist', description='移除佇列中整個 YouTube 播放清單')
+    @app_commands.describe(tag='播放清單編號（不填則顯示清單列表）')
+    async def remove_playlist(self, interaction: discord.Interaction, tag: int = None):
+        queue = self.get_queue(interaction.guild_id)
+        if not queue:
+            await interaction.response.send_message('📭 佇列是空的。', ephemeral=True)
+            return
+
+        # Find all playlist tags in queue
+        tags_in_queue: dict[int, dict] = {}
+        for t in queue:
+            if t.playlist_tag is not None:
+                if t.playlist_tag not in tags_in_queue:
+                    tags_in_queue[t.playlist_tag] = {'count': 0, 'first': t.title}
+                tags_in_queue[t.playlist_tag]['count'] += 1
+
+        if not tags_in_queue:
+            await interaction.response.send_message('佇列中沒有播放清單的歌曲。', ephemeral=True)
+            return
+
+        if tag is None:
+            # Show list
+            desc = '\n'.join(
+                f'`#{t}` — **{info["first"]}** 等 {info["count"]} 首'
+                for t, info in sorted(tags_in_queue.items())
+            )
+            embed = discord.Embed(
+                title='📋 佇列中的播放清單',
+                description=desc,
+                color=discord.Color.blue(),
+            )
+            embed.set_footer(text='使用 /remove-playlist <編號> 來移除整個清單')
+            await interaction.response.send_message(embed=embed)
+            return
+
+        if tag not in tags_in_queue:
+            await interaction.response.send_message(
+                f'❌ 找不到播放清單 `#{tag}`', ephemeral=True)
+            return
+
+        new_queue = deque(t for t in queue if t.playlist_tag != tag)
+        removed = len(queue) - len(new_queue)
+        self.queues[interaction.guild_id] = new_queue
+        self._schedule_prefetch(interaction.guild_id)
+        await interaction.response.send_message(
+            f'🗑️ 已移除播放清單 `#{tag}`（共 {removed} 首）')
 
     # ── /pause ────────────────────────────────────────────────────────
     @app_commands.command(name='pause', description='暫停播放')
@@ -673,27 +803,55 @@ class MusicCog(commands.Cog):
         lst = list(queue)
         random.shuffle(lst)
         self.queues[interaction.guild_id] = deque(lst)
+        self._schedule_prefetch(interaction.guild_id)  # front likely changed
         await interaction.response.send_message(f'🔀 已隨機排列 {len(lst)} 首歌曲！')
 
     # ── /autoplay ──────────────────────────────────────────────────────
     @app_commands.command(name='autoplay', description='切換自動推薦播放（佇列結束後自動播放相關歌曲）')
     async def autoplay_cmd(self, interaction: discord.Interaction):
         guild_id = interaction.guild_id
-        self.autoplay[guild_id] = not self.autoplay.get(guild_id, False)
+        self.autoplay[guild_id] = not self.autoplay.get(guild_id, True)
         status = '開啟 🎶' if self.autoplay[guild_id] else '關閉'
         await interaction.response.send_message(f'自動推薦播放已{status}')
 
-    # ── Auto-disconnect when channel is empty ─────────────────────────
+    # ── Auto-disconnect when channel is empty (with grace period) ─────
+    LEAVE_GRACE_SECONDS = 30
+
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member,
                                     before: discord.VoiceState,
                                     after: discord.VoiceState):
-        vc = member.guild.voice_client
+        if member.bot:
+            return
+        guild = member.guild
+        vc = guild.voice_client
         if not vc:
             return
-        if len(vc.channel.members) == 1:
-            self._cleanup_guild(member.guild.id)
-            await vc.disconnect()
+
+        alone = len(vc.channel.members) == 1  # only the bot left
+        existing = self._leave_tasks.get(guild.id)
+
+        if alone:
+            if existing is None or existing.done():
+                self._leave_tasks[guild.id] = self.bot.loop.create_task(
+                    self._leave_after_grace(guild))
+        else:
+            # Someone is (back) in the channel: cancel any pending leave
+            if existing and not existing.done():
+                existing.cancel()
+            self._leave_tasks.pop(guild.id, None)
+
+    async def _leave_after_grace(self, guild: discord.Guild):
+        try:
+            await asyncio.sleep(self.LEAVE_GRACE_SECONDS)
+            vc = guild.voice_client
+            if vc and len(vc.channel.members) == 1:
+                self._cleanup_guild(guild.id)
+                await vc.disconnect()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._leave_tasks.pop(guild.id, None)
 
 
 async def setup(bot: commands.Bot):
