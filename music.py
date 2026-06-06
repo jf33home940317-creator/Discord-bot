@@ -21,7 +21,14 @@ FFMPEG_EXECUTABLE = os.getenv(
 )
 
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    # Robust reconnection for flaky networks + quieter logging.
+    # -reconnect_on_network_error handles the "Input/output error" drops;
+    # -loglevel error hides the noisy "Will reconnect" chatter.
+    'before_options': (
+        '-reconnect 1 -reconnect_streamed 1 '
+        '-reconnect_on_network_error 1 -reconnect_delay_max 10 '
+        '-loglevel error'
+    ),
     'options': '-vn',
 }
 
