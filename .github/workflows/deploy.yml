@@ -1,0 +1,19 @@
+name: Deploy dcbot              # workflow 的名字（显示在 Actions 页）
+
+on:                             # ① 触发条件
+  push:
+    branches: [ main ]          # 有人 push 到 main 分支就触发
+
+jobs:
+  deploy:                       # 一个叫 deploy 的工作
+    runs-on: self-hosted        # ③ 在「你 VM 上的 runner」执行 ← 关键！
+
+    steps:
+      - name: 拉最新程式码
+        run: cd ~/discord-bot && git pull
+
+      - name: 重建并重启容器
+        run: cd ~/discord-bot && docker compose up -d --build
+
+      - name: 显示状态
+        run: cd ~/discord-bot && docker compose ps
